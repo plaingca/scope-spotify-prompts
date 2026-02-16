@@ -21,7 +21,7 @@ class SpotifyPromptsConfig(BasePipelineConfig):
         "Polls Spotify now-playing, generates a visual prompt with OpenAI, and injects "
         "that prompt into the downstream pipeline on track changes and optional random/manual refreshes."
     )
-    pipeline_version = "0.2.0"
+    pipeline_version = "0.2.1"
 
     supports_prompts = True
     modes = {"video": ModeDefaults(input_size=1, default=True)}
@@ -68,7 +68,7 @@ class SpotifyPromptsConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(
             order=4,
             label="Creative Direction",
-            category="input",
+            category="configuration",
         ),
     )
     prompt_weight: float = Field(
@@ -79,7 +79,7 @@ class SpotifyPromptsConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(
             order=5,
             label="Prompt Weight",
-            category="input",
+            category="configuration",
         ),
     )
     reset_cache_on_track_change: bool = Field(
@@ -88,7 +88,7 @@ class SpotifyPromptsConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(
             order=6,
             label="Reset Cache On Track Change",
-            category="input",
+            category="configuration",
         ),
     )
     enable_random_prompt_switches: bool = Field(
@@ -97,7 +97,7 @@ class SpotifyPromptsConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(
             order=7,
             label="Enable Random Prompt Switches",
-            category="input",
+            category="configuration",
         ),
     )
     random_switch_min_seconds: int = Field(
@@ -108,7 +108,7 @@ class SpotifyPromptsConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(
             order=8,
             label="Random Switch Min (s)",
-            category="input",
+            category="configuration",
         ),
     )
     random_switch_max_seconds: int = Field(
@@ -119,7 +119,7 @@ class SpotifyPromptsConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(
             order=9,
             label="Random Switch Max (s)",
-            category="input",
+            category="configuration",
         ),
     )
     soft_transition_steps: int = Field(
@@ -130,7 +130,7 @@ class SpotifyPromptsConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(
             order=10,
             label="Random/Manual Transition Steps",
-            category="input",
+            category="configuration",
         ),
     )
     soft_transition_method: Literal["linear", "slerp"] = Field(
@@ -139,7 +139,7 @@ class SpotifyPromptsConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(
             order=11,
             label="Random/Manual Transition Method",
-            category="input",
+            category="configuration",
         ),
     )
     manual_prompt_refresh_counter: int = Field(
@@ -149,6 +149,6 @@ class SpotifyPromptsConfig(BasePipelineConfig):
         json_schema_extra=ui_field_config(
             order=12,
             label="Generate New Prompt (+/-)",
-            category="input",
+            category="configuration",
         ),
     )
