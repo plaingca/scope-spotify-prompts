@@ -1,0 +1,20 @@
+[project]
+name = "scope-spotify-prompts"
+version = "0.1.0"
+description = "Spotify now-playing prompt generator plugin for Daydream Scope"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Patrick" },
+]
+dependencies = [
+    "requests>=2.32.0",
+]
+
+[project.entry-points."scope"]
+scope_spotify_prompts = "scope_spotify_prompts.plugin"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
