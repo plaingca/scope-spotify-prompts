@@ -6,8 +6,9 @@ This plugin runs as a Scope preprocessor:
 
 1. Poll Spotify for the currently playing track.
 2. Generate a visual prompt using OpenAI Responses API.
-3. Inject that prompt into the downstream pipeline on track change.
-4. Optionally send `reset_cache=true` for cleaner transitions.
+3. Inject hard-cut prompt updates on track change (with optional `reset_cache=true`).
+4. Optionally inject random or manual prompt refreshes during the same track.
+5. Use soft prompt transitions for random/manual refreshes (no hard cache clear).
 
 ## Setup
 
@@ -56,6 +57,18 @@ Or from Scope UI plugin settings, install the same local folder path.
    - `Creative Direction` (runtime)
    - `Prompt Weight` (runtime)
    - `Reset Cache On Track Change` (runtime)
+   - `Enable Random Prompt Switches` (runtime)
+   - `Random Switch Min (s)` / `Random Switch Max (s)` (runtime)
+   - `Random/Manual Transition Steps` + `Random/Manual Transition Method` (runtime)
+   - `Generate New Prompt (+/-)` (runtime manual trigger)
+
+## Manual Trigger
+
+Scope currently renders plugin runtime params as generic schema controls.
+For this plugin, the `Generate New Prompt (+/-)` runtime field is the manual trigger:
+
+- Click `+` (or `-`) once to request a new prompt immediately.
+- The plugin detects the value change and generates a fresh prompt without a hard cut.
 
 ## Notes
 

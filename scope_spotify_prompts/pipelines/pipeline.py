@@ -6,11 +6,12 @@ import base64
 import logging
 import os
 import queue
+import random
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import requests
 import torch
@@ -25,6 +26,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 _DOTENV_LOCK = threading.Lock()
 _DOTENV_LOADED = False
+PromptUpdateKind = Literal["track_change", "random", "manual"]
+
+_RANDOM_VARIATION_HINTS: tuple[str, ...] = (
+    "shift the color palette and lighting mood while keeping scene coherence",
+    "reinterpret the same song as a different visual environment",
+    "change the dominant subject and motion pattern",
+    "move from abstract textures to grounded cinematic scenery",
+    "move from grounded scenery to abstract rhythmic forms",
+    "change scale dramatically: intimate micro-world to vast landscape",
+)
 
 
 def _load_dotenv() -> None:
@@ -170,13 +181,29 @@ class OpenAIPromptClient:
             return " ".join(parts).strip()
         raise RuntimeError("OpenAI response did not include prompt text")
 
-    def generate_visual_prompt(self, track: SpotifyTrack, user_idea: str) -> str:
+    def generate_visual_prompt(
+        self,
+        track: SpotifyTrack,
+        user_idea: str,
+        variation_hint: str | None = None,
+        previous_prompt: str | None = None,
+    ) -> str:
+        variation_block = (
+            f"Variation request: {variation_hint}\n" if variation_hint else ""
+        )
+        previous_prompt_block = (
+            f"Previous prompt to avoid copying verbatim: {previous_prompt}\n"
+            if previous_prompt
+            else ""
+        )
         user_block = (
             "Generate a single cinematic video prompt for a diffusion model.\n"
             f"Song title: {track.title}\n"
             f"Artist(s): {track.artists}\n"
             f"Album: {track.album}\n"
             f"User creative direction: {user_idea or 'None'}\n"
+            f"{variation_block}"
+            f"{previous_prompt_block}"
             "Constraints: vivid visual language, present tense, <= 80 words, "
             "safe for work, no artist names, no camera metadata unless useful."
         )
@@ -213,7 +240,7 @@ class OpenAIPromptClient:
 
 
 class SpotifyPromptsPipeline(Pipeline):
-    """Poll Spotify and inject generated prompts on track change."""
+    """Poll Spotify and inject generated prompts for track, random, or manual updates."""
 
     @classmethod
     def get_config_class(cls) -> type["BasePipelineConfig"]:
@@ -227,6 +254,12 @@ class SpotifyPromptsPipeline(Pipeline):
         user_idea: str = "",
         prompt_weight: float = 1.0,
         reset_cache_on_track_change: bool = True,
+        enable_random_prompt_switches: bool = True,
+        random_switch_min_seconds: int = 20,
+        random_switch_max_seconds: int = 45,
+        soft_transition_steps: int = 4,
+        soft_transition_method: str = "slerp",
+        manual_prompt_refresh_counter: int = 0,
         device: torch.device | None = None,
         **kwargs,
     ):
@@ -239,14 +272,28 @@ class SpotifyPromptsPipeline(Pipeline):
         self.poll_interval_seconds = max(2.0, float(poll_interval_seconds))
         self.prompt_weight = float(prompt_weight)
         self.reset_cache_on_track_change = bool(reset_cache_on_track_change)
+        self.enable_random_prompt_switches = bool(enable_random_prompt_switches)
+        self.random_switch_min_seconds = max(3, int(random_switch_min_seconds))
+        self.random_switch_max_seconds = max(
+            self.random_switch_min_seconds, int(random_switch_max_seconds)
+        )
+        self.soft_transition_steps = max(0, int(soft_transition_steps))
+        self.soft_transition_method = self._normalize_transition_method(
+            soft_transition_method
+        )
+        self.manual_prompt_refresh_counter = int(manual_prompt_refresh_counter)
 
         self._state_lock = threading.Lock()
         self._user_idea = user_idea.strip()
+        self._pending_manual_refresh = False
         self._last_track_id: str | None = None
         self._last_prompt: str = ""
+        self._last_random_hint: str | None = None
+        self._next_random_prompt_at: float | None = None
 
         self._prompt_updates: queue.Queue[dict[str, str]] = queue.Queue(maxsize=2)
         self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
         self._poll_thread: threading.Thread | None = None
 
         _load_dotenv()
@@ -275,6 +322,54 @@ class SpotifyPromptsPipeline(Pipeline):
             self.poll_interval_seconds,
         )
 
+    @staticmethod
+    def _normalize_transition_method(value: str) -> Literal["linear", "slerp"]:
+        normalized = str(value).strip().lower()
+        return "linear" if normalized == "linear" else "slerp"
+
+    def _mark_manual_refresh_requested(self) -> None:
+        with self._state_lock:
+            self._pending_manual_refresh = True
+        self._wake_event.set()
+
+    def _consume_manual_refresh_requested(self) -> bool:
+        with self._state_lock:
+            if not self._pending_manual_refresh:
+                return False
+            self._pending_manual_refresh = False
+            return True
+
+    def _schedule_next_random_prompt(self, now: float | None = None) -> None:
+        if not self.enable_random_prompt_switches:
+            self._next_random_prompt_at = None
+            return
+        base_time = now if now is not None else time.monotonic()
+        interval = random.uniform(
+            float(self.random_switch_min_seconds),
+            float(self.random_switch_max_seconds),
+        )
+        self._next_random_prompt_at = base_time + interval
+
+    def _choose_random_variation_hint(self) -> str:
+        hint = random.choice(_RANDOM_VARIATION_HINTS)
+        if hint == self._last_random_hint and len(_RANDOM_VARIATION_HINTS) > 1:
+            hint = random.choice(
+                tuple(item for item in _RANDOM_VARIATION_HINTS if item != hint)
+            )
+        self._last_random_hint = hint
+        return hint
+
+    def _wait_for_next_poll(self) -> None:
+        deadline = time.monotonic() + self.poll_interval_seconds
+        while not self._stop_event.is_set():
+            if self._wake_event.is_set():
+                self._wake_event.clear()
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            self._stop_event.wait(min(0.4, remaining))
+
     def _build_spotify_client(self) -> SpotifyClient | None:
         client_id = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
         client_secret = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
@@ -300,34 +395,55 @@ class SpotifyPromptsPipeline(Pipeline):
             base_url=base_url,
         )
 
-    def _fallback_prompt(self, track: SpotifyTrack) -> str:
+    def _fallback_prompt(
+        self,
+        track: SpotifyTrack,
+        variation_hint: str | None = None,
+    ) -> str:
         with self._state_lock:
             user_idea = self._user_idea
 
         suffix = f" Extra direction: {user_idea}." if user_idea else ""
+        variation_suffix = (
+            f" Alternate pass: {variation_hint}."
+            if variation_hint
+            else ""
+        )
         return (
             f"Cinematic abstract reinterpretation of '{track.title}' by {track.artists}, "
             f"rhythmic motion, luminous particles, rich contrast, immersive atmosphere, "
             f"smooth temporal continuity, detailed textures, dynamic but coherent scene evolution."
             f"{suffix}"
+            f"{variation_suffix}"
         )
 
-    def _prompt_for_track(self, track: SpotifyTrack) -> str:
+    def _prompt_for_track(self, track: SpotifyTrack, update_kind: PromptUpdateKind) -> str:
+        variation_hint = (
+            self._choose_random_variation_hint()
+            if update_kind in {"random", "manual"}
+            else None
+        )
         if self.openai_client is None:
-            return self._fallback_prompt(track)
+            return self._fallback_prompt(track, variation_hint=variation_hint)
 
         with self._state_lock:
             user_idea = self._user_idea
+        previous_prompt = self._last_prompt if self._last_prompt else None
         try:
-            return self.openai_client.generate_visual_prompt(track, user_idea)
+            return self.openai_client.generate_visual_prompt(
+                track,
+                user_idea,
+                variation_hint=variation_hint,
+                previous_prompt=previous_prompt,
+            )
         except Exception as exc:
             logger.error(
                 "SPOTIFY-PROMPTS: OpenAI generation failed, using fallback: %s", exc
             )
-            return self._fallback_prompt(track)
+            return self._fallback_prompt(track, variation_hint=variation_hint)
 
-    def _enqueue_prompt_update(self, prompt: str) -> None:
-        payload = {"prompt": prompt}
+    def _enqueue_prompt_update(self, prompt: str, update_kind: PromptUpdateKind) -> None:
+        payload = {"prompt": prompt, "update_kind": update_kind}
         try:
             self._prompt_updates.put_nowait(payload)
             return
@@ -344,6 +460,21 @@ class SpotifyPromptsPipeline(Pipeline):
         except queue.Full:
             pass
 
+    def _process_prompt_update(self, track: SpotifyTrack, update_kind: PromptUpdateKind) -> None:
+        prompt = self._prompt_for_track(track, update_kind=update_kind)
+        if not prompt:
+            return
+        if prompt == self._last_prompt and update_kind != "track_change":
+            return
+        self._last_prompt = prompt
+        self._enqueue_prompt_update(prompt, update_kind=update_kind)
+        logger.info(
+            "SPOTIFY-PROMPTS: update=%s track='%s' artists='%s'",
+            update_kind,
+            track.title,
+            track.artists,
+        )
+
     def _poll_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
@@ -354,19 +485,29 @@ class SpotifyPromptsPipeline(Pipeline):
                 if track and track.is_playing and track.track_id:
                     if track.track_id != self._last_track_id:
                         self._last_track_id = track.track_id
-                        prompt = self._prompt_for_track(track)
-                        if prompt and prompt != self._last_prompt:
-                            self._last_prompt = prompt
-                            self._enqueue_prompt_update(prompt)
-                            logger.info(
-                                "SPOTIFY-PROMPTS: track='%s' artists='%s'",
-                                track.title,
-                                track.artists,
-                            )
+                        self._process_prompt_update(track, update_kind="track_change")
+                        with self._state_lock:
+                            self._pending_manual_refresh = False
+                        self._schedule_next_random_prompt()
+                    elif self._consume_manual_refresh_requested():
+                        self._process_prompt_update(track, update_kind="manual")
+                        self._schedule_next_random_prompt()
+                    elif (
+                        self.enable_random_prompt_switches
+                        and self._next_random_prompt_at is not None
+                        and time.monotonic() >= self._next_random_prompt_at
+                    ):
+                        self._process_prompt_update(track, update_kind="random")
+                        self._schedule_next_random_prompt()
+                    elif (
+                        self.enable_random_prompt_switches
+                        and self._next_random_prompt_at is None
+                    ):
+                        self._schedule_next_random_prompt()
             except Exception as exc:
                 logger.error("SPOTIFY-PROMPTS: poll error: %s", exc)
 
-            self._stop_event.wait(self.poll_interval_seconds)
+            self._wait_for_next_poll()
 
     def prepare(self, **kwargs) -> Requirements | None:
         if kwargs.get("video") is not None:
@@ -386,6 +527,63 @@ class SpotifyPromptsPipeline(Pipeline):
 
         if "reset_cache_on_track_change" in kwargs:
             self.reset_cache_on_track_change = bool(kwargs["reset_cache_on_track_change"])
+
+        if "enable_random_prompt_switches" in kwargs:
+            new_enabled = bool(kwargs["enable_random_prompt_switches"])
+            if new_enabled != self.enable_random_prompt_switches:
+                self.enable_random_prompt_switches = new_enabled
+                if not self.enable_random_prompt_switches:
+                    self._next_random_prompt_at = None
+                else:
+                    self._schedule_next_random_prompt()
+
+        if "random_switch_min_seconds" in kwargs:
+            try:
+                new_min = max(
+                    3, int(kwargs["random_switch_min_seconds"])
+                )
+                if new_min != self.random_switch_min_seconds:
+                    self.random_switch_min_seconds = new_min
+                    self.random_switch_max_seconds = max(
+                        self.random_switch_max_seconds, self.random_switch_min_seconds
+                    )
+                    self._schedule_next_random_prompt()
+            except (TypeError, ValueError):
+                pass
+
+        if "random_switch_max_seconds" in kwargs:
+            try:
+                new_max = max(
+                    self.random_switch_min_seconds,
+                    int(kwargs["random_switch_max_seconds"]),
+                )
+                if new_max != self.random_switch_max_seconds:
+                    self.random_switch_max_seconds = new_max
+                    self._schedule_next_random_prompt()
+            except (TypeError, ValueError):
+                pass
+
+        if "soft_transition_steps" in kwargs:
+            try:
+                self.soft_transition_steps = max(0, int(kwargs["soft_transition_steps"]))
+            except (TypeError, ValueError):
+                pass
+
+        if "soft_transition_method" in kwargs:
+            self.soft_transition_method = self._normalize_transition_method(
+                str(kwargs["soft_transition_method"])
+            )
+
+        if "manual_prompt_refresh_counter" in kwargs:
+            try:
+                refresh_counter = int(kwargs["manual_prompt_refresh_counter"])
+            except (TypeError, ValueError):
+                refresh_counter = self.manual_prompt_refresh_counter
+
+            if refresh_counter != self.manual_prompt_refresh_counter:
+                self.manual_prompt_refresh_counter = refresh_counter
+                self._mark_manual_refresh_requested()
+                logger.info("SPOTIFY-PROMPTS: manual refresh requested")
 
     def __call__(self, **kwargs) -> dict:
         self._apply_runtime_overrides(**kwargs)
@@ -410,12 +608,27 @@ class SpotifyPromptsPipeline(Pipeline):
         if not prompt:
             return output
 
-        output["prompts"] = [{"text": prompt, "weight": self.prompt_weight}]
-        if self.reset_cache_on_track_change:
-            output["reset_cache"] = True
+        prompt_payload = [{"text": prompt, "weight": self.prompt_weight}]
+        update_kind = update.get("update_kind", "track_change")
+
+        if update_kind == "track_change":
+            output["prompts"] = prompt_payload
+            if self.reset_cache_on_track_change:
+                output["reset_cache"] = True
+            return output
+
+        if self.soft_transition_steps > 0:
+            output["transition"] = {
+                "target_prompts": prompt_payload,
+                "num_steps": self.soft_transition_steps,
+                "temporal_interpolation_method": self.soft_transition_method,
+            }
+        else:
+            output["prompts"] = prompt_payload
         return output
 
     def __del__(self):
         self._stop_event.set()
+        self._wake_event.set()
         if self._poll_thread and self._poll_thread.is_alive():
             self._poll_thread.join(timeout=3)
