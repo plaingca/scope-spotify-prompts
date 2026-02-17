@@ -9,6 +9,7 @@ import queue
 import random
 import threading
 import time
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -256,6 +257,9 @@ class OpenAIPromptClient:
 class SpotifyPromptsPipeline(Pipeline):
     """Poll Spotify and inject generated prompts for track, random, or manual updates."""
 
+    _INSTANCE_LOCK = threading.Lock()
+    _ACTIVE_INSTANCE: "weakref.ReferenceType[SpotifyPromptsPipeline] | None" = None
+
     @classmethod
     def get_config_class(cls) -> type["BasePipelineConfig"]:
         return SpotifyPromptsConfig
@@ -328,6 +332,8 @@ class SpotifyPromptsPipeline(Pipeline):
             )
             return
 
+        self._set_as_active_instance()
+
         self._poll_thread = threading.Thread(
             target=self._poll_loop,
             name="spotify-prompts-poller",
@@ -338,6 +344,35 @@ class SpotifyPromptsPipeline(Pipeline):
             "SPOTIFY-PROMPTS: started polling Spotify every %.1fs",
             self.poll_interval_seconds,
         )
+
+    def _set_as_active_instance(self) -> None:
+        previous_instance: SpotifyPromptsPipeline | None = None
+        with self.__class__._INSTANCE_LOCK:
+            if self.__class__._ACTIVE_INSTANCE is not None:
+                previous_instance = self.__class__._ACTIVE_INSTANCE()
+            self.__class__._ACTIVE_INSTANCE = weakref.ref(self)
+
+        if previous_instance is not None and previous_instance is not self:
+            previous_instance._stop_poller()
+
+    def _is_active_instance(self) -> bool:
+        with self.__class__._INSTANCE_LOCK:
+            if self.__class__._ACTIVE_INSTANCE is None:
+                return False
+            current = self.__class__._ACTIVE_INSTANCE()
+            return current is self
+
+    def _stop_poller(self) -> None:
+        self._stop_event.set()
+        self._wake_event.set()
+        if self._poll_thread and self._poll_thread.is_alive():
+            if threading.current_thread() is not self._poll_thread:
+                self._poll_thread.join(timeout=3)
+        with self.__class__._INSTANCE_LOCK:
+            if self.__class__._ACTIVE_INSTANCE is not None:
+                current = self.__class__._ACTIVE_INSTANCE()
+                if current is self:
+                    self.__class__._ACTIVE_INSTANCE = None
 
     @staticmethod
     def _normalize_transition_method(value: str) -> Literal["linear", "slerp"]:
@@ -519,6 +554,8 @@ class SpotifyPromptsPipeline(Pipeline):
     def _poll_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
+                if not self._is_active_instance():
+                    return
                 if self.spotify_client is None:
                     return
 
@@ -531,15 +568,26 @@ class SpotifyPromptsPipeline(Pipeline):
                             self._pending_manual_refresh = False
                         self._schedule_next_random_prompt()
                     elif self._consume_manual_refresh_requested():
-                        self._process_prompt_update(track, update_kind="manual")
-                        self._schedule_next_random_prompt()
+                        if self._prompt_updates.empty():
+                            self._process_prompt_update(track, update_kind="manual")
+                            self._schedule_next_random_prompt()
+                        else:
+                            self._next_random_prompt_at = time.monotonic() + max(
+                                1.0, self.poll_interval_seconds * 0.75
+                            )
                     elif (
                         self.enable_random_prompt_switches
                         and self._next_random_prompt_at is not None
                         and time.monotonic() >= self._next_random_prompt_at
                     ):
-                        self._process_prompt_update(track, update_kind="random")
-                        self._schedule_next_random_prompt()
+                        if self._prompt_updates.empty():
+                            self._process_prompt_update(track, update_kind="random")
+                            self._schedule_next_random_prompt()
+                        else:
+                            # Defer random generation until the previous update has been consumed.
+                            self._next_random_prompt_at = time.monotonic() + max(
+                                1.0, self.poll_interval_seconds * 0.75
+                            )
                     elif (
                         self.enable_random_prompt_switches
                         and self._next_random_prompt_at is None
@@ -646,6 +694,8 @@ class SpotifyPromptsPipeline(Pipeline):
         frames = frame.unsqueeze(0).to(device=self.device, dtype=torch.float32) / 255.0
         output: dict[str, Any] = {"video": frames.clamp(0, 1)}
 
+        if not self._is_active_instance():
+            return output
         try:
             update = self._prompt_updates.get_nowait()
         except queue.Empty:
@@ -675,10 +725,7 @@ class SpotifyPromptsPipeline(Pipeline):
         return output
 
     def __del__(self):
-        self._stop_event.set()
-        self._wake_event.set()
-        if self._poll_thread and self._poll_thread.is_alive():
-            self._poll_thread.join(timeout=3)
+        self._stop_poller()
 
 
 class SpotifyPromptOverlayPipeline(Pipeline):
