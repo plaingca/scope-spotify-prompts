@@ -722,6 +722,11 @@ class SpotifyPromptOverlayPipeline(Pipeline):
         self._ticker_offset_px = 0.0
         self._ticker_last_tick_time = time.monotonic()
         self._ticker_state_key = ""
+        self._ticker_strip_image: Any = None
+        self._ticker_strip_key = ""
+        self._ticker_strip_width = 1
+        self._panel_bg_image: Any = None
+        self._panel_bg_key = ""
 
     def prepare(self, **kwargs) -> Requirements | None:
         if kwargs.get("video") is not None:
@@ -795,6 +800,14 @@ class SpotifyPromptOverlayPipeline(Pipeline):
             data = frame_cpu.to(torch.uint8)
         return data.contiguous().numpy()
 
+    @staticmethod
+    def _to_output_video(frame: torch.Tensor) -> torch.Tensor:
+        if frame.dtype.is_floating_point:
+            tensor = frame.to(dtype=torch.float32).clamp(0, 1)
+        else:
+            tensor = frame.to(dtype=torch.float32) / 255.0
+        return tensor.unsqueeze(0)
+
     def _is_stale(self, updated_at_iso: str) -> bool:
         if not updated_at_iso:
             return True
@@ -840,6 +853,47 @@ class SpotifyPromptOverlayPipeline(Pipeline):
         except Exception:
             return max(1, int(draw.textlength(text, font=font)))
 
+    def _get_panel_background(self, width: int, panel_height: int) -> Any:
+        alpha = int(255 * self.overlay_opacity)
+        cache_key = f"{width}|{panel_height}|{alpha}"
+        if self._panel_bg_image is not None and cache_key == self._panel_bg_key:
+            return self._panel_bg_image
+
+        self._panel_bg_image = Image.new("RGBA", (width, panel_height), (0, 0, 0, alpha))
+        self._panel_bg_key = cache_key
+        return self._panel_bg_image
+
+    def _ensure_ticker_strip(
+        self,
+        ticker_text: str,
+        state_key: str,
+        width: int,
+        panel_height: int,
+        font: Any,
+    ) -> tuple[Any, int]:
+        strip_key = (
+            f"{state_key}|{width}|{panel_height}|{self.overlay_font_size}"
+            f"|{self.overlay_max_prompt_chars}"
+        )
+        if self._ticker_strip_image is not None and strip_key == self._ticker_strip_key:
+            return self._ticker_strip_image, self._ticker_strip_width
+
+        probe = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+        probe_draw = ImageDraw.Draw(probe)
+        text_width = self._text_width(probe_draw, ticker_text, font=font)
+        gap = max(40, int(self.overlay_font_size * 1.8))
+        strip_width = max(1, text_width + gap)
+
+        strip = Image.new("RGBA", (strip_width, panel_height), (0, 0, 0, 0))
+        strip_draw = ImageDraw.Draw(strip)
+        text_y = max(2, (panel_height - self.overlay_font_size) // 2 - 1)
+        strip_draw.text((0, text_y), ticker_text, font=font, fill=(255, 255, 255, 235))
+
+        self._ticker_strip_image = strip
+        self._ticker_strip_key = strip_key
+        self._ticker_strip_width = strip_width
+        return strip, strip_width
+
     def __call__(self, **kwargs) -> dict:
         self._apply_runtime_overrides(**kwargs)
 
@@ -850,18 +904,10 @@ class SpotifyPromptOverlayPipeline(Pipeline):
         frame = video_input[0] if isinstance(video_input, list) else video_input
         if frame.dim() == 4:
             frame = frame.squeeze(0)
-
-        input_device = frame.device
-        frame_np = self._to_uint8_frame(frame)
-        base_output = {
-            "video": torch.from_numpy(frame_np)
-            .unsqueeze(0)
-            .to(device=input_device, dtype=torch.float32)
-            / 255.0
-        }
+        passthrough = {"video": self._to_output_video(frame)}
 
         if not self.overlay_enabled:
-            return base_output
+            return passthrough
 
         if not _PIL_AVAILABLE:
             if not self._pil_warned:
@@ -869,13 +915,11 @@ class SpotifyPromptOverlayPipeline(Pipeline):
                     "SPOTIFY-PROMPT-OVERLAY: Pillow is unavailable; overlay disabled."
                 )
                 self._pil_warned = True
-            return base_output
+            return passthrough
 
-        height, width, _ = frame_np.shape
-        panel_height = max(42, int(height * self.overlay_height_ratio))
         ticker_text, state_key = self._build_ticker_text()
         if not ticker_text:
-            return base_output
+            return passthrough
 
         now = time.monotonic()
         elapsed = max(0.0, now - self._ticker_last_tick_time)
@@ -884,21 +928,29 @@ class SpotifyPromptOverlayPipeline(Pipeline):
             self._ticker_state_key = state_key
             self._ticker_offset_px = 0.0
 
+        frame_np = self._to_uint8_frame(frame)
+        input_device = frame.device
+        height, width, _ = frame_np.shape
+        panel_height = max(42, int(height * self.overlay_height_ratio))
+
         font = self._get_font()
         image = Image.fromarray(frame_np, mode="RGB").convert("RGBA")
-        panel = Image.new("RGBA", (width, panel_height), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(panel)
-        alpha = int(255 * self.overlay_opacity)
-        draw.rectangle((0, 0, width, panel_height), fill=(0, 0, 0, alpha))
+        panel = self._get_panel_background(width=width, panel_height=panel_height).copy()
+        ticker_strip, strip_width = self._ensure_ticker_strip(
+            ticker_text=ticker_text,
+            state_key=state_key,
+            width=width,
+            panel_height=panel_height,
+            font=font,
+        )
 
         self._ticker_offset_px += self.overlay_ticker_speed_px_per_sec * elapsed
-        text_width = self._text_width(draw, ticker_text, font=font)
-        text_x = int(width - self._ticker_offset_px)
-        text_y = max(2, (panel_height - self.overlay_font_size) // 2 - 1)
-        draw.text((text_x, text_y), ticker_text, font=font, fill=(255, 255, 255, 235))
-
-        if text_x + text_width < 0:
-            self._ticker_offset_px = 0.0
+        if strip_width > 0:
+            self._ticker_offset_px %= float(strip_width)
+        x = int(width - self._ticker_offset_px)
+        while x < width:
+            panel.paste(ticker_strip, (x, 0), ticker_strip)
+            x += strip_width
 
         image.alpha_composite(panel, dest=(0, height - panel_height))
         composited = image.convert("RGB")
