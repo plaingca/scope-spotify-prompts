@@ -8,7 +8,6 @@ import os
 import queue
 import random
 import threading
-import textwrap
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -197,6 +196,7 @@ class OpenAIPromptClient:
         self,
         track: SpotifyTrack,
         user_idea: str,
+        max_words: int,
         variation_hint: str | None = None,
         previous_prompt: str | None = None,
     ) -> str:
@@ -216,9 +216,11 @@ class OpenAIPromptClient:
             f"User creative direction: {user_idea or 'None'}\n"
             f"{variation_block}"
             f"{previous_prompt_block}"
-            "Constraints: vivid visual language, present tense, <= 80 words, "
+            f"Constraints: vivid visual language, present tense, <= {max_words} words, "
             "safe for work, no artist names, no camera metadata unless useful."
         )
+
+        max_output_tokens = max(90, min(220, int(max_words * 3.0) + 18))
 
         request_body = {
             "model": self.model,
@@ -232,7 +234,7 @@ class OpenAIPromptClient:
                     "content": [{"type": "input_text", "text": user_block}],
                 },
             ],
-            "max_output_tokens": 220,
+            "max_output_tokens": max_output_tokens,
         }
 
         response = requests.post(
@@ -272,6 +274,7 @@ class SpotifyPromptsPipeline(Pipeline):
         soft_transition_steps: int = 4,
         soft_transition_method: str = "slerp",
         manual_prompt_refresh_counter: int = 0,
+        prompt_max_words: int = 40,
         device: torch.device | None = None,
         **kwargs,
     ):
@@ -294,6 +297,7 @@ class SpotifyPromptsPipeline(Pipeline):
             soft_transition_method
         )
         self.manual_prompt_refresh_counter = int(manual_prompt_refresh_counter)
+        self.prompt_max_words = max(12, min(80, int(prompt_max_words)))
 
         self._state_lock = threading.Lock()
         self._user_idea = user_idea.strip()
@@ -407,6 +411,16 @@ class SpotifyPromptsPipeline(Pipeline):
             base_url=base_url,
         )
 
+    @staticmethod
+    def _truncate_prompt_to_max_words(prompt: str, max_words: int) -> str:
+        text = " ".join(prompt.strip().split())
+        if not text:
+            return ""
+        words = text.split(" ")
+        if len(words) <= max_words:
+            return text
+        return " ".join(words[:max_words]).rstrip(" ,;:.")
+
     def _fallback_prompt(
         self,
         track: SpotifyTrack,
@@ -421,13 +435,14 @@ class SpotifyPromptsPipeline(Pipeline):
             if variation_hint
             else ""
         )
-        return (
+        prompt = (
             f"Cinematic abstract reinterpretation of '{track.title}' by {track.artists}, "
             f"rhythmic motion, luminous particles, rich contrast, immersive atmosphere, "
             f"smooth temporal continuity, detailed textures, dynamic but coherent scene evolution."
             f"{suffix}"
             f"{variation_suffix}"
         )
+        return self._truncate_prompt_to_max_words(prompt, self.prompt_max_words)
 
     def _prompt_for_track(self, track: SpotifyTrack, update_kind: PromptUpdateKind) -> str:
         variation_hint = (
@@ -442,12 +457,14 @@ class SpotifyPromptsPipeline(Pipeline):
             user_idea = self._user_idea
         previous_prompt = self._last_prompt if self._last_prompt else None
         try:
-            return self.openai_client.generate_visual_prompt(
+            prompt = self.openai_client.generate_visual_prompt(
                 track,
                 user_idea,
+                max_words=self.prompt_max_words,
                 variation_hint=variation_hint,
                 previous_prompt=previous_prompt,
             )
+            return self._truncate_prompt_to_max_words(prompt, self.prompt_max_words)
         except Exception as exc:
             logger.error(
                 "SPOTIFY-PROMPTS: OpenAI generation failed, using fallback: %s", exc
@@ -608,6 +625,12 @@ class SpotifyPromptsPipeline(Pipeline):
                 self._mark_manual_refresh_requested()
                 logger.info("SPOTIFY-PROMPTS: manual refresh requested")
 
+        if "prompt_max_words" in kwargs:
+            try:
+                self.prompt_max_words = max(12, min(80, int(kwargs["prompt_max_words"])))
+            except (TypeError, ValueError):
+                pass
+
     def __call__(self, **kwargs) -> dict:
         self._apply_runtime_overrides(**kwargs)
 
@@ -668,11 +691,12 @@ class SpotifyPromptOverlayPipeline(Pipeline):
         self,
         overlay_enabled: bool = True,
         overlay_opacity: float = 0.72,
-        overlay_height_ratio: float = 0.22,
+        overlay_height_ratio: float = 0.12,
         overlay_font_size: int = 18,
-        overlay_max_prompt_chars: int = 220,
+        overlay_max_prompt_chars: int = 160,
         overlay_show_track: bool = True,
         overlay_show_update_kind: bool = True,
+        overlay_ticker_speed_px_per_sec: float = 90.0,
         overlay_stale_after_seconds: int = 120,
         device: torch.device | None = None,
         **kwargs,
@@ -684,14 +708,20 @@ class SpotifyPromptOverlayPipeline(Pipeline):
         )
         self.overlay_enabled = bool(overlay_enabled)
         self.overlay_opacity = float(max(0.0, min(1.0, overlay_opacity)))
-        self.overlay_height_ratio = float(max(0.1, min(0.45, overlay_height_ratio)))
+        self.overlay_height_ratio = float(max(0.07, min(0.25, overlay_height_ratio)))
         self.overlay_font_size = int(max(10, min(64, overlay_font_size)))
         self.overlay_max_prompt_chars = int(max(30, min(600, overlay_max_prompt_chars)))
         self.overlay_show_track = bool(overlay_show_track)
         self.overlay_show_update_kind = bool(overlay_show_update_kind)
+        self.overlay_ticker_speed_px_per_sec = float(
+            max(10.0, min(420.0, overlay_ticker_speed_px_per_sec))
+        )
         self.overlay_stale_after_seconds = int(max(1, overlay_stale_after_seconds))
         self._font: Any = None
         self._pil_warned = False
+        self._ticker_offset_px = 0.0
+        self._ticker_last_tick_time = time.monotonic()
+        self._ticker_state_key = ""
 
     def prepare(self, **kwargs) -> Requirements | None:
         if kwargs.get("video") is not None:
@@ -709,7 +739,7 @@ class SpotifyPromptOverlayPipeline(Pipeline):
         if "overlay_height_ratio" in kwargs:
             try:
                 self.overlay_height_ratio = float(
-                    max(0.1, min(0.45, kwargs["overlay_height_ratio"]))
+                    max(0.07, min(0.25, kwargs["overlay_height_ratio"]))
                 )
             except (TypeError, ValueError):
                 pass
@@ -730,6 +760,13 @@ class SpotifyPromptOverlayPipeline(Pipeline):
             self.overlay_show_track = bool(kwargs["overlay_show_track"])
         if "overlay_show_update_kind" in kwargs:
             self.overlay_show_update_kind = bool(kwargs["overlay_show_update_kind"])
+        if "overlay_ticker_speed_px_per_sec" in kwargs:
+            try:
+                self.overlay_ticker_speed_px_per_sec = float(
+                    max(10.0, min(420.0, kwargs["overlay_ticker_speed_px_per_sec"]))
+                )
+            except (TypeError, ValueError):
+                pass
         if "overlay_stale_after_seconds" in kwargs:
             try:
                 self.overlay_stale_after_seconds = int(
@@ -768,39 +805,40 @@ class SpotifyPromptOverlayPipeline(Pipeline):
         except Exception:
             return True
 
-    def _build_overlay_lines(self, width: int, panel_height: int) -> list[str]:
+    def _build_ticker_text(self) -> tuple[str, str]:
         state = get_latest_prompt_state()
         if not state.prompt or self._is_stale(state.updated_at_iso):
-            return []
+            return "", ""
 
-        lines: list[str] = []
+        parts: list[str] = []
         if self.overlay_show_update_kind:
             kind = state.update_kind.replace("_", " ").strip().upper() or "PROMPT"
-            lines.append(f"Spotify Prompt - {kind}")
+            parts.append(f"SPOTIFY PROMPT [{kind}]")
 
         if self.overlay_show_track and state.track_title:
             track = state.track_title
             if state.track_artists:
                 track = f"{track} - {state.track_artists}"
-            lines.append(track)
+            parts.append(track)
 
-        prompt_text = state.prompt.strip()[: self.overlay_max_prompt_chars]
+        raw_prompt = state.prompt.strip()
+        prompt_text = raw_prompt[: self.overlay_max_prompt_chars]
+        if len(raw_prompt) > self.overlay_max_prompt_chars:
+            prompt_text = prompt_text.rstrip() + "..."
         if prompt_text:
-            padding = max(10, int(self.overlay_font_size * 0.65))
-            chars_per_line = max(
-                26,
-                int((width - (padding * 2)) / max(8.0, self.overlay_font_size * 0.56)),
-            )
-            wrapped = textwrap.wrap(prompt_text, width=chars_per_line) or [prompt_text]
-            lines.extend(wrapped)
+            parts.append(prompt_text)
 
-        line_height = self.overlay_font_size + 4
-        max_lines = max(1, (panel_height - 12) // line_height)
-        if len(lines) > max_lines:
-            lines = lines[:max_lines]
-            if lines and not lines[-1].endswith("..."):
-                lines[-1] = lines[-1][: max(0, len(lines[-1]) - 3)].rstrip() + "..."
-        return lines
+        ticker_text = " | ".join(p for p in parts if p).strip()
+        state_key = f"{state.updated_at_iso}|{ticker_text}"
+        return ticker_text, state_key
+
+    @staticmethod
+    def _text_width(draw: Any, text: str, font: Any) -> int:
+        try:
+            bbox = draw.textbbox((0, 0), text, font=font)
+            return max(1, int(bbox[2] - bbox[0]))
+        except Exception:
+            return max(1, int(draw.textlength(text, font=font)))
 
     def __call__(self, **kwargs) -> dict:
         self._apply_runtime_overrides(**kwargs)
@@ -835,9 +873,16 @@ class SpotifyPromptOverlayPipeline(Pipeline):
 
         height, width, _ = frame_np.shape
         panel_height = max(42, int(height * self.overlay_height_ratio))
-        lines = self._build_overlay_lines(width=width, panel_height=panel_height)
-        if not lines:
+        ticker_text, state_key = self._build_ticker_text()
+        if not ticker_text:
             return base_output
+
+        now = time.monotonic()
+        elapsed = max(0.0, now - self._ticker_last_tick_time)
+        self._ticker_last_tick_time = now
+        if state_key != self._ticker_state_key:
+            self._ticker_state_key = state_key
+            self._ticker_offset_px = 0.0
 
         font = self._get_font()
         image = Image.fromarray(frame_np, mode="RGB").convert("RGBA")
@@ -846,13 +891,14 @@ class SpotifyPromptOverlayPipeline(Pipeline):
         alpha = int(255 * self.overlay_opacity)
         draw.rectangle((0, 0, width, panel_height), fill=(0, 0, 0, alpha))
 
-        padding_x = max(10, int(self.overlay_font_size * 0.65))
-        y = max(8, int(self.overlay_font_size * 0.35))
-        for line in lines:
-            draw.text((padding_x, y), line, font=font, fill=(255, 255, 255, 235))
-            y += self.overlay_font_size + 4
-            if y >= panel_height - self.overlay_font_size:
-                break
+        self._ticker_offset_px += self.overlay_ticker_speed_px_per_sec * elapsed
+        text_width = self._text_width(draw, ticker_text, font=font)
+        text_x = int(width - self._ticker_offset_px)
+        text_y = max(2, (panel_height - self.overlay_font_size) // 2 - 1)
+        draw.text((text_x, text_y), ticker_text, font=font, fill=(255, 255, 255, 235))
+
+        if text_x + text_width < 0:
+            self._ticker_offset_px = 0.0
 
         image.alpha_composite(panel, dest=(0, height - panel_height))
         composited = image.convert("RGB")

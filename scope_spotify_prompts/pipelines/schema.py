@@ -21,7 +21,7 @@ class SpotifyPromptsConfig(BasePipelineConfig):
         "Polls Spotify now-playing, generates a visual prompt with OpenAI, and injects "
         "that prompt into the downstream pipeline on track changes and optional random/manual refreshes."
     )
-    pipeline_version = "0.2.2"
+    pipeline_version = "0.3.1"
 
     supports_prompts = True
     modes = {"video": ModeDefaults(input_size=1, default=True)}
@@ -152,6 +152,17 @@ class SpotifyPromptsConfig(BasePipelineConfig):
             category="configuration",
         ),
     )
+    prompt_max_words: int = Field(
+        default=40,
+        ge=12,
+        le=80,
+        description="Upper bound for generated prompt length in words.",
+        json_schema_extra=ui_field_config(
+            order=13,
+            label="Prompt Max Words",
+            category="configuration",
+        ),
+    )
 
 
 class SpotifyPromptOverlayConfig(BasePipelineConfig):
@@ -162,7 +173,7 @@ class SpotifyPromptOverlayConfig(BasePipelineConfig):
     pipeline_description = (
         "Draws the most recent Spotify prompt at the bottom of output frames."
     )
-    pipeline_version = "0.1.0"
+    pipeline_version = "0.2.0"
 
     supports_prompts = False
     modes = {"video": ModeDefaults(input_size=1, default=True)}
@@ -192,10 +203,10 @@ class SpotifyPromptOverlayConfig(BasePipelineConfig):
         ),
     )
     overlay_height_ratio: float = Field(
-        default=0.22,
-        ge=0.1,
-        le=0.45,
-        description="Height of the overlay panel as a fraction of frame height.",
+        default=0.12,
+        ge=0.07,
+        le=0.25,
+        description="Height of the ticker panel as a fraction of frame height.",
         json_schema_extra=ui_field_config(
             order=3,
             label="Overlay Height Ratio",
@@ -214,10 +225,10 @@ class SpotifyPromptOverlayConfig(BasePipelineConfig):
         ),
     )
     overlay_max_prompt_chars: int = Field(
-        default=220,
+        default=160,
         ge=30,
         le=600,
-        description="Maximum prompt characters to render before truncation.",
+        description="Maximum prompt characters included in the scrolling ticker.",
         json_schema_extra=ui_field_config(
             order=5,
             label="Overlay Max Prompt Chars",
@@ -242,13 +253,24 @@ class SpotifyPromptOverlayConfig(BasePipelineConfig):
             category="configuration",
         ),
     )
+    overlay_ticker_speed_px_per_sec: float = Field(
+        default=90.0,
+        ge=10.0,
+        le=420.0,
+        description="Ticker scroll speed in pixels per second.",
+        json_schema_extra=ui_field_config(
+            order=8,
+            label="Ticker Speed (px/s)",
+            category="configuration",
+        ),
+    )
     overlay_stale_after_seconds: int = Field(
         default=120,
         ge=1,
         le=3600,
         description="Hide overlay when last prompt update is older than this age.",
         json_schema_extra=ui_field_config(
-            order=8,
+            order=9,
             label="Overlay Stale Timeout (s)",
             category="configuration",
         ),
