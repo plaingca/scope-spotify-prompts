@@ -307,7 +307,8 @@ class SpotifyPromptsPipeline(Pipeline):
         self._last_random_hint: str | None = None
         self._next_random_prompt_at: float | None = None
 
-        self._prompt_updates: queue.Queue[dict[str, str]] = queue.Queue(maxsize=2)
+        # Keep only the latest pending prompt update to avoid bursty back-to-back retriggers.
+        self._prompt_updates: queue.Queue[dict[str, str]] = queue.Queue(maxsize=1)
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._poll_thread: threading.Thread | None = None
@@ -862,7 +863,8 @@ class SpotifyPromptOverlayPipeline(Pipeline):
             parts.append(prompt_text)
 
         ticker_text = " | ".join(p for p in parts if p).strip()
-        state_key = f"{state.updated_at_iso}|{ticker_text}"
+        # Restart scroll only when visible ticker content changes, not when timestamps refresh.
+        state_key = ticker_text
         return ticker_text, state_key
 
     @staticmethod
