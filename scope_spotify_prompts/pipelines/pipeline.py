@@ -79,6 +79,24 @@ class SpotifyAuthError(RuntimeError):
     """Spotify authentication/configuration error."""
 
 
+class SpotifyRateLimitError(RuntimeError):
+    """Spotify API rate-limiting error with optional Retry-After guidance."""
+
+    def __init__(
+        self,
+        retry_after_seconds: float | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        self.retry_after_seconds = retry_after_seconds
+        self.error_message = error_message
+        details = "Spotify API rate limit reached (429)"
+        if retry_after_seconds is not None:
+            details = f"{details}; Retry-After={retry_after_seconds:.3f}s"
+        if error_message:
+            details = f"{details}; message={error_message}"
+        super().__init__(details)
+
+
 @dataclass
 class SpotifyTrack:
     track_id: str
@@ -126,6 +144,33 @@ class SpotifyClient:
             return self._access_token
         return self._refresh_access_token()
 
+    @staticmethod
+    def _parse_retry_after_seconds(header_value: str | None) -> float | None:
+        if header_value is None:
+            return None
+        try:
+            retry_after = float(header_value.strip())
+        except ValueError:
+            return None
+        if retry_after <= 0:
+            return None
+        return retry_after
+
+    @staticmethod
+    def _extract_error_message(response: requests.Response) -> str | None:
+        try:
+            payload = response.json()
+        except ValueError:
+            return None
+        error = payload.get("error")
+        if not isinstance(error, dict):
+            return None
+        message = error.get("message")
+        if not isinstance(message, str):
+            return None
+        message = message.strip()
+        return message or None
+
     def get_current_track(self) -> SpotifyTrack | None:
         token = self._get_access_token()
         response = requests.get(
@@ -142,6 +187,28 @@ class SpotifyClient:
                 "https://api.spotify.com/v1/me/player/currently-playing",
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=20,
+            )
+        if response.status_code == 429:
+            retry_after_seconds = self._parse_retry_after_seconds(
+                response.headers.get("Retry-After")
+            )
+            error_message = self._extract_error_message(response)
+            if retry_after_seconds is None:
+                logger.error(
+                    "SPOTIFY-PROMPTS: Spotify returned 429; Retry-After header is missing or invalid."
+                )
+            else:
+                logger.error(
+                    "SPOTIFY-PROMPTS: Spotify returned 429; Retry-After=%.3fs.",
+                    retry_after_seconds,
+                )
+            logger.error(
+                "SPOTIFY-PROMPTS: Spotify 429 error message: %s",
+                error_message or "not provided",
+            )
+            raise SpotifyRateLimitError(
+                retry_after_seconds=retry_after_seconds,
+                error_message=error_message,
             )
         if response.status_code >= 400:
             raise RuntimeError(
@@ -289,6 +356,7 @@ class SpotifyPromptsPipeline(Pipeline):
         )
 
         self.poll_interval_seconds = max(2.0, float(poll_interval_seconds))
+        self._rate_limit_poll_interval_seconds: float | None = None
         self.prompt_weight = float(prompt_weight)
         self.reset_cache_on_track_change = bool(reset_cache_on_track_change)
         self.enable_random_prompt_switches = bool(enable_random_prompt_switches)
@@ -412,11 +480,17 @@ class SpotifyPromptsPipeline(Pipeline):
         return hint
 
     def _wait_for_next_poll(self) -> None:
-        deadline = time.monotonic() + self.poll_interval_seconds
+        interval_seconds = (
+            self._rate_limit_poll_interval_seconds
+            if self._rate_limit_poll_interval_seconds is not None
+            else self.poll_interval_seconds
+        )
+        deadline = time.monotonic() + interval_seconds
         while not self._stop_event.is_set():
             if self._wake_event.is_set():
                 self._wake_event.clear()
-                return
+                if self._rate_limit_poll_interval_seconds is None:
+                    return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
@@ -560,6 +634,12 @@ class SpotifyPromptsPipeline(Pipeline):
                     return
 
                 track = self.spotify_client.get_current_track()
+                if self._rate_limit_poll_interval_seconds is not None:
+                    logger.info(
+                        "SPOTIFY-PROMPTS: Spotify requests recovered; restoring poll interval to %.1fs.",
+                        self.poll_interval_seconds,
+                    )
+                    self._rate_limit_poll_interval_seconds = None
                 if track and track.is_playing and track.track_id:
                     if track.track_id != self._last_track_id:
                         self._last_track_id = track.track_id
@@ -593,6 +673,18 @@ class SpotifyPromptsPipeline(Pipeline):
                         and self._next_random_prompt_at is None
                     ):
                         self._schedule_next_random_prompt()
+            except SpotifyRateLimitError as exc:
+                if exc.retry_after_seconds is not None:
+                    self._rate_limit_poll_interval_seconds = exc.retry_after_seconds
+                    logger.error(
+                        "SPOTIFY-PROMPTS: rate limit backoff active; poll interval set to Retry-After %.3fs.",
+                        exc.retry_after_seconds,
+                    )
+                else:
+                    logger.error(
+                        "SPOTIFY-PROMPTS: rate limit backoff active without Retry-After; keeping poll interval at %.1fs.",
+                        self.poll_interval_seconds,
+                    )
             except Exception as exc:
                 logger.error("SPOTIFY-PROMPTS: poll error: %s", exc)
 
