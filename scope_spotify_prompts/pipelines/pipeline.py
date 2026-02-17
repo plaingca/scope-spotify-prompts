@@ -697,6 +697,7 @@ class SpotifyPromptOverlayPipeline(Pipeline):
         overlay_show_track: bool = True,
         overlay_show_update_kind: bool = True,
         overlay_ticker_speed_px_per_sec: float = 90.0,
+        overlay_max_output_fps: float = 20.0,
         overlay_stale_after_seconds: int = 120,
         device: torch.device | None = None,
         **kwargs,
@@ -716,6 +717,7 @@ class SpotifyPromptOverlayPipeline(Pipeline):
         self.overlay_ticker_speed_px_per_sec = float(
             max(10.0, min(420.0, overlay_ticker_speed_px_per_sec))
         )
+        self.overlay_max_output_fps = float(max(1.0, min(120.0, overlay_max_output_fps)))
         self.overlay_stale_after_seconds = int(max(1, overlay_stale_after_seconds))
         self._font: Any = None
         self._pil_warned = False
@@ -727,6 +729,7 @@ class SpotifyPromptOverlayPipeline(Pipeline):
         self._ticker_strip_width = 1
         self._panel_bg_image: Any = None
         self._panel_bg_key = ""
+        self._last_emit_time = 0.0
 
     def prepare(self, **kwargs) -> Requirements | None:
         if kwargs.get("video") is not None:
@@ -772,6 +775,13 @@ class SpotifyPromptOverlayPipeline(Pipeline):
                 )
             except (TypeError, ValueError):
                 pass
+        if "overlay_max_output_fps" in kwargs:
+            try:
+                self.overlay_max_output_fps = float(
+                    max(1.0, min(120.0, kwargs["overlay_max_output_fps"]))
+                )
+            except (TypeError, ValueError):
+                pass
         if "overlay_stale_after_seconds" in kwargs:
             try:
                 self.overlay_stale_after_seconds = int(
@@ -779,6 +789,16 @@ class SpotifyPromptOverlayPipeline(Pipeline):
                 )
             except (TypeError, ValueError):
                 pass
+
+    def _apply_emit_rate_limit(self) -> None:
+        now = time.monotonic()
+        min_interval = 1.0 / self.overlay_max_output_fps
+        if self._last_emit_time > 0.0:
+            elapsed = now - self._last_emit_time
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
+                now = time.monotonic()
+        self._last_emit_time = now
 
     def _get_font(self) -> Any:
         if self._font is not None:
@@ -896,6 +916,7 @@ class SpotifyPromptOverlayPipeline(Pipeline):
 
     def __call__(self, **kwargs) -> dict:
         self._apply_runtime_overrides(**kwargs)
+        self._apply_emit_rate_limit()
 
         video_input = kwargs.get("video")
         if video_input is None:

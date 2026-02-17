@@ -173,7 +173,7 @@ class SpotifyPromptOverlayConfig(BasePipelineConfig):
     pipeline_description = (
         "Draws the most recent Spotify prompt at the bottom of output frames."
     )
-    pipeline_version = "0.2.0"
+    pipeline_version = "0.2.1"
 
     supports_prompts = False
     modes = {"video": ModeDefaults(input_size=1, default=True)}
@@ -264,13 +264,24 @@ class SpotifyPromptOverlayConfig(BasePipelineConfig):
             category="configuration",
         ),
     )
+    overlay_max_output_fps: float = Field(
+        default=20.0,
+        ge=1.0,
+        le=120.0,
+        description="Rate-limit overlay output to smooth bursty frame batches.",
+        json_schema_extra=ui_field_config(
+            order=9,
+            label="Overlay Max Output FPS",
+            category="configuration",
+        ),
+    )
     overlay_stale_after_seconds: int = Field(
         default=120,
         ge=1,
         le=3600,
         description="Hide overlay when last prompt update is older than this age.",
         json_schema_extra=ui_field_config(
-            order=9,
+            order=10,
             label="Overlay Stale Timeout (s)",
             category="configuration",
         ),
