@@ -10,6 +10,10 @@ This plugin runs as a Scope preprocessor:
 4. Optionally inject random or manual prompt refreshes during the same track.
 5. Use soft prompt transitions for random/manual refreshes (no hard cache clear).
 
+It also provides an optional postprocessor:
+
+- `Spotify Prompt Overlay`: draws the latest Spotify prompt in a bottom text panel.
+
 ## Setup
 
 Recommended: create a `.env` file in the Scope working directory (Scope root).
@@ -50,8 +54,9 @@ Or from Scope UI plugin settings, install the same local folder path.
 
 1. Add `Spotify Prompts` as a preprocessor.
 2. Choose your main generation pipeline as downstream.
-3. Keep stream input mode as `video` when using video passthrough pipelines.
-4. Configure:
+3. (Optional) Add `Spotify Prompt Overlay` as a postprocessor to visualize active prompts on the output frames.
+4. Keep stream input mode as `video` when using video passthrough pipelines.
+5. Configure:
    - `Spotify Poll Interval (s)`
    - `OpenAI Model`
    - `Creative Direction` (runtime)
@@ -69,6 +74,21 @@ For this plugin, the `Generate New Prompt (+/-)` runtime field is the manual tri
 
 - Click `+` (or `-`) once to request a new prompt immediately.
 - The plugin detects the value change and generates a fresh prompt without a hard cut.
+
+## Prompt Visibility
+
+At the moment, Scope's timeline UI is frontend-driven and only updates from prompts submitted in the UI itself.
+Preprocessor-injected prompts are applied in the backend pipeline chain, so they are not automatically reflected in the timeline.
+
+For live visibility, this plugin now logs structured prompt updates:
+
+- `SPOTIFY-PROMPTS: >>> NEW PROMPT (<kind>): '<text>'`
+
+You can run the included monitor overlay:
+
+```powershell
+python .\tools\scope-spotify-prompt-monitor.pyw
+```
 
 ## Notes
 

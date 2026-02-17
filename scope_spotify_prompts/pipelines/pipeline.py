@@ -8,17 +8,29 @@ import os
 import queue
 import random
 import threading
+import textwrap
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+import numpy as np
 import requests
 import torch
 
 from scope.core.pipelines.interface import Pipeline, Requirements
 
-from .schema import SpotifyPromptsConfig
+from .schema import SpotifyPromptOverlayConfig, SpotifyPromptsConfig
+from ..state import get_latest_prompt_state, set_latest_prompt_state
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+
+    _PIL_AVAILABLE = True
+except Exception:
+    Image = ImageDraw = ImageFont = None  # type: ignore[assignment]
+    _PIL_AVAILABLE = False
 
 if TYPE_CHECKING:
     from scope.core.pipelines.base_schema import BasePipelineConfig
@@ -468,11 +480,22 @@ class SpotifyPromptsPipeline(Pipeline):
             return
         self._last_prompt = prompt
         self._enqueue_prompt_update(prompt, update_kind=update_kind)
+        set_latest_prompt_state(
+            prompt=prompt,
+            update_kind=update_kind,
+            track_title=track.title,
+            track_artists=track.artists,
+        )
         logger.info(
             "SPOTIFY-PROMPTS: update=%s track='%s' artists='%s'",
             update_kind,
             track.title,
             track.artists,
+        )
+        logger.info(
+            "SPOTIFY-PROMPTS: >>> NEW PROMPT (%s): '%s'",
+            update_kind,
+            prompt,
         )
 
     def _poll_loop(self) -> None:
@@ -632,3 +655,212 @@ class SpotifyPromptsPipeline(Pipeline):
         self._wake_event.set()
         if self._poll_thread and self._poll_thread.is_alive():
             self._poll_thread.join(timeout=3)
+
+
+class SpotifyPromptOverlayPipeline(Pipeline):
+    """Postprocessor that overlays the latest Spotify prompt on output frames."""
+
+    @classmethod
+    def get_config_class(cls) -> type["BasePipelineConfig"]:
+        return SpotifyPromptOverlayConfig
+
+    def __init__(
+        self,
+        overlay_enabled: bool = True,
+        overlay_opacity: float = 0.72,
+        overlay_height_ratio: float = 0.22,
+        overlay_font_size: int = 18,
+        overlay_max_prompt_chars: int = 220,
+        overlay_show_track: bool = True,
+        overlay_show_update_kind: bool = True,
+        overlay_stale_after_seconds: int = 120,
+        device: torch.device | None = None,
+        **kwargs,
+    ):
+        self.device = (
+            device
+            if device is not None
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        self.overlay_enabled = bool(overlay_enabled)
+        self.overlay_opacity = float(max(0.0, min(1.0, overlay_opacity)))
+        self.overlay_height_ratio = float(max(0.1, min(0.45, overlay_height_ratio)))
+        self.overlay_font_size = int(max(10, min(64, overlay_font_size)))
+        self.overlay_max_prompt_chars = int(max(30, min(600, overlay_max_prompt_chars)))
+        self.overlay_show_track = bool(overlay_show_track)
+        self.overlay_show_update_kind = bool(overlay_show_update_kind)
+        self.overlay_stale_after_seconds = int(max(1, overlay_stale_after_seconds))
+        self._font: Any = None
+        self._pil_warned = False
+
+    def prepare(self, **kwargs) -> Requirements | None:
+        if kwargs.get("video") is not None:
+            return Requirements(input_size=1)
+        return None
+
+    def _apply_runtime_overrides(self, **kwargs) -> None:
+        if "overlay_enabled" in kwargs:
+            self.overlay_enabled = bool(kwargs["overlay_enabled"])
+        if "overlay_opacity" in kwargs:
+            try:
+                self.overlay_opacity = float(max(0.0, min(1.0, kwargs["overlay_opacity"])))
+            except (TypeError, ValueError):
+                pass
+        if "overlay_height_ratio" in kwargs:
+            try:
+                self.overlay_height_ratio = float(
+                    max(0.1, min(0.45, kwargs["overlay_height_ratio"]))
+                )
+            except (TypeError, ValueError):
+                pass
+        if "overlay_font_size" in kwargs:
+            try:
+                self.overlay_font_size = int(max(10, min(64, kwargs["overlay_font_size"])))
+                self._font = None
+            except (TypeError, ValueError):
+                pass
+        if "overlay_max_prompt_chars" in kwargs:
+            try:
+                self.overlay_max_prompt_chars = int(
+                    max(30, min(600, kwargs["overlay_max_prompt_chars"]))
+                )
+            except (TypeError, ValueError):
+                pass
+        if "overlay_show_track" in kwargs:
+            self.overlay_show_track = bool(kwargs["overlay_show_track"])
+        if "overlay_show_update_kind" in kwargs:
+            self.overlay_show_update_kind = bool(kwargs["overlay_show_update_kind"])
+        if "overlay_stale_after_seconds" in kwargs:
+            try:
+                self.overlay_stale_after_seconds = int(
+                    max(1, kwargs["overlay_stale_after_seconds"])
+                )
+            except (TypeError, ValueError):
+                pass
+
+    def _get_font(self) -> Any:
+        if self._font is not None:
+            return self._font
+        if not _PIL_AVAILABLE:
+            return None
+        try:
+            self._font = ImageFont.truetype("DejaVuSans.ttf", self.overlay_font_size)
+        except Exception:
+            self._font = ImageFont.load_default()
+        return self._font
+
+    @staticmethod
+    def _to_uint8_frame(frame: torch.Tensor) -> np.ndarray:
+        frame_cpu = frame.detach().to("cpu")
+        if frame_cpu.dtype.is_floating_point:
+            data = (frame_cpu.clamp(0, 1) * 255.0).to(torch.uint8)
+        else:
+            data = frame_cpu.to(torch.uint8)
+        return data.contiguous().numpy()
+
+    def _is_stale(self, updated_at_iso: str) -> bool:
+        if not updated_at_iso:
+            return True
+        try:
+            updated_at = datetime.fromisoformat(updated_at_iso)
+            age_seconds = (datetime.now(tz=timezone.utc) - updated_at).total_seconds()
+            return age_seconds > self.overlay_stale_after_seconds
+        except Exception:
+            return True
+
+    def _build_overlay_lines(self, width: int, panel_height: int) -> list[str]:
+        state = get_latest_prompt_state()
+        if not state.prompt or self._is_stale(state.updated_at_iso):
+            return []
+
+        lines: list[str] = []
+        if self.overlay_show_update_kind:
+            kind = state.update_kind.replace("_", " ").strip().upper() or "PROMPT"
+            lines.append(f"Spotify Prompt - {kind}")
+
+        if self.overlay_show_track and state.track_title:
+            track = state.track_title
+            if state.track_artists:
+                track = f"{track} - {state.track_artists}"
+            lines.append(track)
+
+        prompt_text = state.prompt.strip()[: self.overlay_max_prompt_chars]
+        if prompt_text:
+            padding = max(10, int(self.overlay_font_size * 0.65))
+            chars_per_line = max(
+                26,
+                int((width - (padding * 2)) / max(8.0, self.overlay_font_size * 0.56)),
+            )
+            wrapped = textwrap.wrap(prompt_text, width=chars_per_line) or [prompt_text]
+            lines.extend(wrapped)
+
+        line_height = self.overlay_font_size + 4
+        max_lines = max(1, (panel_height - 12) // line_height)
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            if lines and not lines[-1].endswith("..."):
+                lines[-1] = lines[-1][: max(0, len(lines[-1]) - 3)].rstrip() + "..."
+        return lines
+
+    def __call__(self, **kwargs) -> dict:
+        self._apply_runtime_overrides(**kwargs)
+
+        video_input = kwargs.get("video")
+        if video_input is None:
+            return {}
+
+        frame = video_input[0] if isinstance(video_input, list) else video_input
+        if frame.dim() == 4:
+            frame = frame.squeeze(0)
+
+        input_device = frame.device
+        frame_np = self._to_uint8_frame(frame)
+        base_output = {
+            "video": torch.from_numpy(frame_np)
+            .unsqueeze(0)
+            .to(device=input_device, dtype=torch.float32)
+            / 255.0
+        }
+
+        if not self.overlay_enabled:
+            return base_output
+
+        if not _PIL_AVAILABLE:
+            if not self._pil_warned:
+                logger.warning(
+                    "SPOTIFY-PROMPT-OVERLAY: Pillow is unavailable; overlay disabled."
+                )
+                self._pil_warned = True
+            return base_output
+
+        height, width, _ = frame_np.shape
+        panel_height = max(42, int(height * self.overlay_height_ratio))
+        lines = self._build_overlay_lines(width=width, panel_height=panel_height)
+        if not lines:
+            return base_output
+
+        font = self._get_font()
+        image = Image.fromarray(frame_np, mode="RGB").convert("RGBA")
+        panel = Image.new("RGBA", (width, panel_height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(panel)
+        alpha = int(255 * self.overlay_opacity)
+        draw.rectangle((0, 0, width, panel_height), fill=(0, 0, 0, alpha))
+
+        padding_x = max(10, int(self.overlay_font_size * 0.65))
+        y = max(8, int(self.overlay_font_size * 0.35))
+        for line in lines:
+            draw.text((padding_x, y), line, font=font, fill=(255, 255, 255, 235))
+            y += self.overlay_font_size + 4
+            if y >= panel_height - self.overlay_font_size:
+                break
+
+        image.alpha_composite(panel, dest=(0, height - panel_height))
+        composited = image.convert("RGB")
+        composited_np = np.asarray(composited, dtype=np.uint8)
+        output_frame = (
+            torch.from_numpy(composited_np)
+            .unsqueeze(0)
+            .to(device=input_device, dtype=torch.float32)
+            / 255.0
+        )
+        return {"video": output_frame.clamp(0, 1)}

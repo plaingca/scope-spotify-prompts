@@ -1,6 +1,6 @@
 [project]
 name = "scope-spotify-prompts"
-version = "0.2.1"
+version = "0.3.0"
 description = "Spotify now-playing prompt generator plugin for Daydream Scope"
 readme = "README.md"
 license = { text = "MIT" }
@@ -9,6 +9,7 @@ authors = [
     { name = "Patrick Laing" },
 ]
 dependencies = [
+    "Pillow>=10.0.0",
     "requests>=2.32.0",
 ]
 
