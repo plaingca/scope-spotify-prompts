@@ -277,15 +277,15 @@ class OpenAIPromptClient:
             else ""
         )
         user_block = (
-            "Generate a single cinematic video prompt for a diffusion model.\n"
+            "Generate a single cinematic video prompt that matches this song's key vibes, themes, and emotions..\n"
             f"Song title: {track.title}\n"
             f"Artist(s): {track.artists}\n"
             f"Album: {track.album}\n"
             f"User creative direction: {user_idea or 'None'}\n"
             f"{variation_block}"
             f"{previous_prompt_block}"
-            f"Constraints: vivid visual language, present tense, <= {max_words} words, "
-            "safe for work, no artist names, no camera metadata unless useful."
+            f"Constraints: vivid visual language, <= {max_words} words, "
+            "safe for work, no artist names,Lead with what the camera sees first, then describe the subsequent moves"
         )
 
         max_output_tokens = max(90, min(220, int(max_words * 3.0) + 18))
